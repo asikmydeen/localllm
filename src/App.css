@@ -8,9 +8,9 @@
 
 .App-header {
   background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
-  padding: 30px 20px;
+  padding: 20px;
   color: white;
-  margin-bottom: 30px;
+  margin-bottom: 20px;
   box-shadow: var(--box-shadow);
   position: relative;
   overflow: hidden;
@@ -23,25 +23,36 @@
   left: -50%;
   width: 200%;
   height: 200%;
-  background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0) 70%);
+  background: radial-gradient(circle, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0) 70%);
   pointer-events: none;
+  animation: subtle-shine 8s linear infinite;
+}
+
+@keyframes subtle-shine {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .App-header h1 {
   margin: 0;
-  font-size: 2.5rem;
-  font-weight: 700;
+  font-size: 1.8rem;
+  font-weight: 600;
   letter-spacing: -0.5px;
-  text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  text-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .App-header p {
-  margin: 15px 0 0;
-  font-size: 1.1rem;
+  margin: 8px 0 0;
+  font-size: 0.95rem;
   opacity: 0.9;
   max-width: 600px;
   margin-left: auto;
   margin-right: auto;
+  font-weight: 400;
 }
 
 main {
@@ -120,11 +131,11 @@ footer::before {
 
 @media (max-width: 768px) {
   .App-header h1 {
-    font-size: 2rem;
+    font-size: 1.5rem;
   }
 
   .App-header p {
-    font-size: 1rem;
+    font-size: 0.9rem;
   }
 
   main {

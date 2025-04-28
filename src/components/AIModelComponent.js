@@ -1,5 +1,5 @@
 // src/components/AIModelComponent.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   CreateMLCEngine,
   prebuiltAppConfig,
@@ -23,8 +23,23 @@ function AIModelComponent() {
     const [searchQuery, setSearchQuery] = useState('');
     const outputRef = useRef(null);
 
-    // Get available models from prebuilt config
-    const availableModels = prebuiltAppConfig.model_list || [];
+    // Add refs to track current values without causing dependency issues
+    const llmRef = useRef(null);
+    const loadingModelsRef = useRef({});
+
+    // Keep refs in sync with state
+    useEffect(() => {
+        llmRef.current = llm;
+    }, [llm]);
+
+    useEffect(() => {
+        loadingModelsRef.current = loadingModels;
+    }, [loadingModels]);
+
+    // Wrap availableModels in useMemo
+    const availableModels = useMemo(() => {
+        return prebuiltAppConfig.model_list || [];
+    }, []);
 
     // Save selected model to localStorage when it changes
     useEffect(() => {
@@ -59,31 +74,30 @@ function AIModelComponent() {
         }
 
         checkCachedModels();
-    }, []); // Run only once on component mount
+    }, [availableModels, selectedModelId]); // Added missing dependencies
 
     // Load a model
-    const loadModel = async (modelId) => {
+    const loadModel = useCallback(async (modelId) => {
         if (!modelId) return;
 
-        // Skip if already loading this model
-        if (loadingModels[modelId]) {
+        // Use refs instead of state directly
+        const isLoading = loadingModelsRef.current[modelId];
+        if (isLoading) {
             console.log(`Model ${modelId} is already loading, skipping`);
             return;
         }
 
-        // Skip if we already have an active LLM for this model
-        // Note: The engine might store the model name in different properties
-        if (llm && (
-            modelId === llm._model_name ||
-            modelId === llm.model_name ||
-            modelId === llm.modelId
+        const currentLLM = llmRef.current;
+        if (currentLLM && (
+            modelId === currentLLM._model_name ||
+            modelId === currentLLM.model_name ||
+            modelId === currentLLM.modelId
         )) {
             console.log(`Model ${modelId} is already loaded and active, skipping`);
             return;
         }
 
         try {
-            // Set loading state for this specific model
             setLoadingModels(prev => ({
                 ...prev,
                 [modelId]: {
@@ -92,7 +106,6 @@ function AIModelComponent() {
                 }
             }));
 
-            // Clear any previous errors for this model
             setModelErrors(prev => {
                 const newErrors = {...prev};
                 delete newErrors[modelId];
@@ -101,37 +114,27 @@ function AIModelComponent() {
 
             console.log("Loading model:", modelId);
 
-            // Initialize the LLM with the selected model
             const engine = await CreateMLCEngine(modelId, {
                 use_web_worker: true,
                 progress_callback: (progress) => {
-                    console.log(`Progress for ${modelId}:`, progress);
-                    if (progress.type === "download") {
-                        setLoadingModels(prev => ({
-                            ...prev,
-                            [modelId]: {
-                                status: `Downloading model files (${progress.file})...`,
-                                progress: Math.round(progress.progress * 100)
-                            }
-                        }));
-                    } else if (progress.type === "initialize") {
-                        setLoadingModels(prev => ({
-                            ...prev,
-                            [modelId]: {
-                                status: 'Initializing model...',
-                                progress: 50 + Math.round(progress.progress * 50)
-                            }
-                        }));
-                    }
+                    setLoadingModels(prev => ({
+                        ...prev,
+                        [modelId]: {
+                            status: progress.type === "download"
+                                ? `Downloading model files (${progress.file})...`
+                                : 'Initializing model...',
+                            progress: progress.type === "download"
+                                ? Math.round(progress.progress * 100)
+                                : 50 + Math.round(progress.progress * 50)
+                        }
+                    }));
                 }
             });
 
-            // If this is the selected model, set it as the active LLM
             if (modelId === selectedModelId) {
                 setLLM(engine);
             }
 
-            // Remove from loading models
             setLoadingModels(prev => {
                 const newLoading = {...prev};
                 delete newLoading[modelId];
@@ -140,67 +143,46 @@ function AIModelComponent() {
 
             console.log(`Model ${modelId} loaded successfully!`);
 
-            // Update cached models list - only if not already in the list
-            setCachedModels(prev => {
-                if (prev.includes(modelId)) {
-                    return prev;
-                }
-                return [...prev, modelId];
-            });
+            setCachedModels(prev =>
+                prev.includes(modelId) ? prev : [...prev, modelId]
+            );
 
         } catch (err) {
             console.error(`Failed to initialize model ${modelId}:`, err);
-
-            // Set error for this specific model
             setModelErrors(prev => ({
                 ...prev,
                 [modelId]: `Failed to initialize: ${err.message}`
             }));
-
-            // Remove from loading models
             setLoadingModels(prev => {
                 const newLoading = {...prev};
                 delete newLoading[modelId];
                 return newLoading;
             });
         }
-    };
+    }, [selectedModelId]); // selectedModelId is the only dependency needed
 
     // Initialize the WebLLM engine when selectedModelId changes
     useEffect(() => {
-        async function initLLM() {
-            if (!selectedModelId) return;
+        if (!selectedModelId) return;
 
-            // Skip if we already have an active LLM for this model
-            // Note: The engine might store the model name in different properties
-            if (llm && (
-                selectedModelId === llm._model_name ||
-                selectedModelId === llm.model_name ||
-                selectedModelId === llm.modelId
-            )) {
-                console.log(`Model ${selectedModelId} is already loaded and active`);
-                return;
-            }
-
-            // If the model is already cached, load it
-            if (cachedModels.includes(selectedModelId)) {
-                await loadModel(selectedModelId);
-            }
-            // If not cached, start loading it
-            else if (!loadingModels[selectedModelId]) {
-                loadModel(selectedModelId);
-            }
+        const currentLLM = llmRef.current;
+        if (currentLLM && (
+            selectedModelId === currentLLM._model_name ||
+            selectedModelId === currentLLM.model_name ||
+            selectedModelId === currentLLM.modelId
+        )) {
+            console.log(`Model ${selectedModelId} is already loaded and active`);
+            return;
         }
 
-        initLLM();
+        if (cachedModels.includes(selectedModelId) && !loadingModelsRef.current[selectedModelId]) {
+            loadModel(selectedModelId);
+        }
 
-        // Clean up function
         return () => {
-            if (llm) {
-                // Clean up resources if needed
-            }
+            // Cleanup if needed
         };
-    }, [selectedModelId]); // Only reinitialize when selected model changes
+    }, [selectedModelId, cachedModels, loadModel]); // loadingModels removed from dependencies
 
     // Generate text using the model
     const generateText = async () => {
@@ -382,11 +364,11 @@ function AIModelComponent() {
             <div className="chat-interface">
                 {/* Left side - Model selector */}
                 <div className="model-selector">
-                    <h3>Select Model</h3>
+                    <h3>🎯 Pick Your Brain!</h3>
                     <div className="model-search">
                         <input
                             type="text"
-                            placeholder="Search models..."
+                            placeholder="🔍 Find your perfect neural companion..."
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             className="search-input"
@@ -765,7 +747,7 @@ function AIModelComponent() {
                         <textarea
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
-                            placeholder="Enter your prompt here..."
+                            placeholder="🤔 Ask me anything... I'm all ears (and neurons)!"
                             disabled={generating}
                         />
                         <button
@@ -776,17 +758,17 @@ function AIModelComponent() {
                             {generating ? (
                                 <>
                                     <span className="spinner-small"></span>
-                                    Generating...
+                                    🧪 Brewing thoughts...
                                 </>
                             ) : loadingModels[selectedModelId] ? (
                                 <>
                                     <span className="spinner-small"></span>
-                                    Loading Model...
+                                    🔄 Warming up neurons...
                                 </>
                             ) : !llm ? (
-                                'Select a Cached Model'
+                                '🎯 Pick a model first!'
                             ) : (
-                                'Generate'
+                                '✨ Let\'s Go!'
                             )}
                         </button>
                     </div>
@@ -797,11 +779,11 @@ function AIModelComponent() {
                         ) : generating ? (
                             <div className="generating">
                                 <span className="spinner-small"></span>
-                                Generating response...
+                                🤖 Brain cells firing... Hold tight!
                             </div>
                         ) : (
                             <div className="empty-output">
-                                Response will appear here...
+                                <p>🎭 Stage is set! Ask away, and watch the magic happen...</p>
                             </div>
                         )}
                     </div>

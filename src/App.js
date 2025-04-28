@@ -7,14 +7,14 @@ function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <h1>Browser-based AI Demo</h1>
-        <p>Running ML models entirely in your web browser</p>
+        <h1>✨ AI in Your Browser</h1>
+        <p>Unleash the power of local AI, right at your fingertips</p>
       </header>
       <main>
         <AIModelComponent />
       </main>
       <footer>
-        <p>Model runs locally in your browser - no server needed!</p>
+        <p>🚀 100% Local, 100% Private - Your Browser is Now a Supercomputer! 🔒</p>
       </footer>
     </div>
   );
