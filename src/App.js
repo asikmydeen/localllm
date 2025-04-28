@@ -1,23 +1,21 @@
-import logo from './logo.svg';
+// src/App.js
+import React from 'react';
 import './App.css';
+import AIModelComponent from './components/AIModelComponent';
 
 function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
+        <h1>Browser-based AI Demo</h1>
+        <p>Running ML models entirely in your web browser</p>
       </header>
+      <main>
+        <AIModelComponent />
+      </main>
+      <footer>
+        <p>Model runs locally in your browser - no server needed!</p>
+      </footer>
     </div>
   );
 }

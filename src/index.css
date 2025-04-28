@@ -1,13 +1,50 @@
+:root {
+  --primary-color: #3a86ff;
+  --primary-dark: #2667cc;
+  --secondary-color: #8338ec;
+  --success-color: #38b000;
+  --warning-color: #ffbe0b;
+  --danger-color: #ff006e;
+  --light-bg: #f8f9fa;
+  --dark-bg: #212529;
+  --text-color: #333;
+  --text-light: #6c757d;
+  --border-radius: 8px;
+  --box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --transition: all 0.3s ease;
+}
+
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background-color: #f0f2f5;
+  color: var(--text-color);
+  line-height: 1.6;
 }
 
 code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
+  background-color: #f1f1f1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Add a smooth scrolling effect to the page */
+html {
+  scroll-behavior: smooth;
 }
