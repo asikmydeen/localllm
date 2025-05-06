@@ -1,16 +1,33 @@
 // src/components/AIModelComponent.js
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
-  CreateMLCEngine,
   prebuiltAppConfig,
   hasModelInCache,
   deleteModelInCache
 } from '@mlc-ai/web-llm';
+import { LLMWorkerPool } from '../utils/workerModule';
+import {
+  hasModelInDB,
+  saveModelMetadata,
+  deleteModel
+} from '../utils/indexedDBModule';
+import {
+  downloadModelInChunks,
+  isModelDownloadComplete
+} from '../utils/chunkingModule';
+import {
+  registerServiceWorker,
+  addConnectivityListeners
+} from '../utils/serviceWorkerRegistration';
+import { formatOutput } from '../utils/formatOutput';
+import ReactMarkdown from 'react-markdown';
+import CodeBlock from './CodeBlock';
 import './AIModelComponent.css';
 
 function AIModelComponent() {
     const [input, setInput] = useState('Explain how machine learning works in 3 sentences.');
     const [output, setOutput] = useState('');
+    const [formattedOutput, setFormattedOutput] = useState({ formattedContent: '', type: 'text' });
     const [llm, setLLM] = useState(null);
     const [generating, setGenerating] = useState(false);
     const [selectedModelId, setSelectedModelId] = useState(() => {
@@ -21,11 +38,22 @@ function AIModelComponent() {
     const [loadingModels, setLoadingModels] = useState({});
     const [modelErrors, setModelErrors] = useState({});
     const [searchQuery, setSearchQuery] = useState('');
+    const [isOnline, setIsOnline] = useState(navigator.onLine);
+    const [workerPool, setWorkerPool] = useState(null);
+    const [activeWorkerId, setActiveWorkerId] = useState(null);
+    const [downloadProgress, setDownloadProgress] = useState({});
+    const [usingIndexedDB, setUsingIndexedDB] = useState(false);
+    const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+    const [systemPrompt, setSystemPrompt] = useState(() => {
+        // Try to load the system prompt from localStorage
+        return localStorage.getItem('systemPrompt') || '';
+    });
     const outputRef = useRef(null);
 
     // Add refs to track current values without causing dependency issues
     const llmRef = useRef(null);
     const loadingModelsRef = useRef({});
+    const workerPoolRef = useRef(null);
 
     // Keep refs in sync with state
     useEffect(() => {
@@ -35,6 +63,57 @@ function AIModelComponent() {
     useEffect(() => {
         loadingModelsRef.current = loadingModels;
     }, [loadingModels]);
+
+    useEffect(() => {
+        workerPoolRef.current = workerPool;
+    }, [workerPool]);
+
+    // Initialize worker pool
+    useEffect(() => {
+        // Determine optimal number of workers based on hardware
+        const optimalWorkers = Math.max(1, Math.min(
+            navigator.hardwareConcurrency || 4,
+            // Limit based on device memory if available
+            navigator.deviceMemory ? Math.floor(navigator.deviceMemory / 2) : 4
+        ));
+
+        console.log(`Initializing worker pool with ${optimalWorkers} workers`);
+        const pool = new LLMWorkerPool(optimalWorkers);
+        setWorkerPool(pool);
+
+        // Clean up worker pool on unmount
+        return () => {
+            if (pool) {
+                pool.terminate();
+            }
+        };
+    }, []);
+
+    // Handle online/offline status
+    useEffect(() => {
+        const handleOnline = () => {
+            console.log('App is online');
+            setIsOnline(true);
+        };
+
+        const handleOffline = () => {
+            console.log('App is offline');
+            setIsOnline(false);
+        };
+
+        // Register service worker if not already registered
+        registerServiceWorker();
+
+        // Add event listeners for online/offline events
+        const removeListeners = addConnectivityListeners(handleOnline, handleOffline);
+
+        // Initial check
+        setIsOnline(navigator.onLine);
+
+        return () => {
+            removeListeners();
+        };
+    }, []);
 
     // Wrap availableModels in useMemo
     const availableModels = useMemo(() => {
@@ -48,37 +127,68 @@ function AIModelComponent() {
         }
     }, [selectedModelId]);
 
-    // Check which models are cached
+    // Save system prompt to localStorage when it changes
+    useEffect(() => {
+        localStorage.setItem('systemPrompt', systemPrompt);
+    }, [systemPrompt]);
+
+    // Check which models are cached and start download if needed
     useEffect(() => {
         async function checkCachedModels() {
             const cached = [];
+
+            // Check both traditional cache and IndexedDB
             for (const model of availableModels) {
-                const isCached = await hasModelInCache(model.model_id);
-                if (isCached) {
+                const isCachedTraditional = await hasModelInCache(model.model_id);
+                const isCachedIndexedDB = await hasModelInDB(model.model_id);
+
+                if (isCachedTraditional || isCachedIndexedDB) {
                     cached.push(model.model_id);
+
+                    // If it's in IndexedDB but not in traditional cache, mark it
+                    if (isCachedIndexedDB && !isCachedTraditional) {
+                        console.log(`Model ${model.model_id} is cached in IndexedDB`);
+                    }
                 }
             }
+
             setCachedModels(cached);
 
-            // Only set default model if no model is currently selected
-            if (!selectedModelId) {
+            // Handle model selection and download
+            if (!selectedModelId && availableModels.length > 0) {
                 // First try to use a cached model
                 if (cached.length > 0) {
                     setSelectedModelId(cached[0]);
+                    console.log(`Using cached model: ${cached[0]}`);
                 }
-                // If no cached models, use the first available model
-                else if (availableModels.length > 0) {
-                    setSelectedModelId(availableModels[0].model_id);
+                // If no cached models, select the first available model and start downloading it
+                else {
+                    const firstModelId = availableModels[0].model_id;
+                    setSelectedModelId(firstModelId);
+                    console.log(`No cached models found. Starting download of: ${firstModelId}`);
+
+                    // Start downloading the model
+                    if (isOnline && !loadingModelsRef.current[firstModelId]) {
+                        setLoadingModels(prev => ({
+                            ...prev,
+                            [firstModelId]: {
+                                status: 'Starting download...',
+                                progress: 0
+                            }
+                        }));
+
+                        // We'll trigger the actual download in the loadModel effect
+                    }
                 }
             }
         }
 
         checkCachedModels();
-    }, [availableModels, selectedModelId]); // Added missing dependencies
+    }, [availableModels, selectedModelId, isOnline]);
 
-    // Load a model
+    // Load a model using worker pool
     const loadModel = useCallback(async (modelId) => {
-        if (!modelId) return;
+        if (!modelId || !workerPoolRef.current) return;
 
         // Use refs instead of state directly
         const isLoading = loadingModelsRef.current[modelId];
@@ -87,21 +197,22 @@ function AIModelComponent() {
             return;
         }
 
-        const currentLLM = llmRef.current;
-        if (currentLLM && (
-            modelId === currentLLM._model_name ||
-            modelId === currentLLM.model_name ||
-            modelId === currentLLM.modelId
-        )) {
-            console.log(`Model ${modelId} is already loaded and active, skipping`);
-            return;
+        // Check if model is already loaded in a worker
+        if (activeWorkerId && llmRef.current) {
+            const currentLLM = llmRef.current;
+            if (modelId === currentLLM._model_name ||
+                modelId === currentLLM.model_name ||
+                modelId === currentLLM.modelId) {
+                console.log(`Model ${modelId} is already loaded and active, skipping`);
+                return;
+            }
         }
 
         try {
             setLoadingModels(prev => ({
                 ...prev,
                 [modelId]: {
-                    status: 'Initializing WebLLM...',
+                    status: 'Initializing model in worker...',
                     progress: 0
                 }
             }));
@@ -112,11 +223,81 @@ function AIModelComponent() {
                 return newErrors;
             });
 
-            console.log("Loading model:", modelId);
+            console.log("Loading model in worker:", modelId);
 
-            const engine = await CreateMLCEngine(modelId, {
-                use_web_worker: true,
-                progress_callback: (progress) => {
+            // First check if model is available in IndexedDB
+            const isInIndexedDB = await hasModelInDB(modelId);
+            const isDownloadComplete = isInIndexedDB && await isModelDownloadComplete(modelId);
+
+            // Set flag for UI to show we're using IndexedDB
+            setUsingIndexedDB(isDownloadComplete);
+
+            // Create progress callback
+            const progressCallback = (progress) => {
+                if (progress.phase === 'downloading') {
+                    setDownloadProgress(prev => ({
+                        ...prev,
+                        [modelId]: {
+                            phase: 'downloading',
+                            chunk: progress.chunk,
+                            numChunks: progress.numChunks,
+                            progress: progress.progress
+                        }
+                    }));
+
+                    setLoadingModels(prev => ({
+                        ...prev,
+                        [modelId]: {
+                            status: `Downloading model (chunk ${progress.chunk}/${progress.numChunks})...`,
+                            progress: progress.progress
+                        }
+                    }));
+                } else if (progress.phase === 'complete') {
+                    setDownloadProgress(prev => ({
+                        ...prev,
+                        [modelId]: {
+                            phase: 'complete',
+                            progress: 100
+                        }
+                    }));
+
+                    setLoadingModels(prev => ({
+                        ...prev,
+                        [modelId]: {
+                            status: 'Download complete, initializing model...',
+                            progress: 50
+                        }
+                    }));
+                }
+            };
+
+            // If model is not in IndexedDB and we're online, download it
+            if (!isDownloadComplete && isOnline) {
+                // Find model URL from available models
+                const modelInfo = availableModels.find(m => m.model_id === modelId);
+                if (modelInfo && modelInfo.model_url) {
+                    try {
+                        // Save model metadata
+                        await saveModelMetadata({
+                            id: modelId,
+                            name: modelInfo.model_name || modelId,
+                            url: modelInfo.model_url
+                        });
+
+                        // Download model in chunks
+                        await downloadModelInChunks(modelInfo.model_url, modelId, {
+                            progressCallback
+                        });
+                    } catch (downloadError) {
+                        console.error(`Failed to download model ${modelId}:`, downloadError);
+                    }
+                }
+            }
+
+            // Set up a progress handler for this worker
+            workerPoolRef.current.setProgressHandler((progressData) => {
+                if (progressData.modelId === modelId && progressData.progress) {
+                    const progress = progressData.progress;
                     setLoadingModels(prev => ({
                         ...prev,
                         [modelId]: {
@@ -131,8 +312,26 @@ function AIModelComponent() {
                 }
             });
 
+            // Load the model in a worker
+            const result = await workerPoolRef.current.loadModel(modelId, {
+                use_web_worker: true
+            });
+
+            if (!result.success) {
+                throw new Error(result.error || 'Failed to load model in worker');
+            }
+
+            // If this is the selected model, update the active worker ID
             if (modelId === selectedModelId) {
-                setLLM(engine);
+                setActiveWorkerId(result.workerId);
+                setLLM({
+                    // Create a proxy object that will forward calls to the worker
+                    chatCompletion: (params) => workerPoolRef.current.chatCompletion(result.workerId, params.messages, params),
+                    completion: (params) => workerPoolRef.current.generateText(result.workerId, params.prompt, params),
+                    generate: (prompt, params) => workerPoolRef.current.generateText(result.workerId, prompt, params),
+                    unload: () => workerPoolRef.current.unloadModel(result.workerId),
+                    modelId: modelId
+                });
             }
 
             setLoadingModels(prev => {
@@ -141,7 +340,7 @@ function AIModelComponent() {
                 return newLoading;
             });
 
-            console.log(`Model ${modelId} loaded successfully!`);
+            console.log(`Model ${modelId} loaded successfully in worker!`);
 
             setCachedModels(prev =>
                 prev.includes(modelId) ? prev : [...prev, modelId]
@@ -159,7 +358,7 @@ function AIModelComponent() {
                 return newLoading;
             });
         }
-    }, [selectedModelId]); // selectedModelId is the only dependency needed
+    }, [selectedModelId, availableModels, isOnline, activeWorkerId]);
 
     // Initialize the WebLLM engine when selectedModelId changes
     useEffect(() => {
@@ -175,111 +374,122 @@ function AIModelComponent() {
             return;
         }
 
-        if (cachedModels.includes(selectedModelId) && !loadingModelsRef.current[selectedModelId]) {
-            loadModel(selectedModelId);
+        // Check if the model is already loading
+        if (loadingModelsRef.current[selectedModelId]) {
+            console.log(`Model ${selectedModelId} is already loading`);
+            return;
         }
+
+        // Always try to load the selected model, whether it's cached or not
+        console.log(`Initiating load for model: ${selectedModelId}`);
+        loadModel(selectedModelId);
 
         return () => {
             // Cleanup if needed
         };
-    }, [selectedModelId, cachedModels, loadModel]); // loadingModels removed from dependencies
+    }, [selectedModelId, loadModel]); // Removed cachedModels from dependencies
 
-    // Generate text using the model
+    // Generate text using the model in worker
     const generateText = async () => {
-        if (!llm || !input.trim()) return;
+        if (!llm || !input.trim() || !activeWorkerId || !workerPoolRef.current) return;
 
         try {
             setGenerating(true);
             setOutput('');
+            setFormattedOutput({ formattedContent: '', type: 'text' });
 
-            // Log the engine object
-            console.log("Engine object:", llm);
+            console.log("Generating text using worker:", activeWorkerId);
 
-            // Check which methods are available on the model
-            const hasCompletion = typeof llm.completion === 'function';
-            const hasChatCompletion = typeof llm.chatCompletion === 'function';
-            const hasGenerate = typeof llm.generate === 'function';
-
-            console.log("Available methods:", {
-                hasCompletion,
-                hasChatCompletion,
-                hasGenerate
-            });
-
+            // We'll try chat completion first, then fall back to completion or generate
             let responseText = '';
+            let result;
 
-            // Try the available methods in order of preference
-            if (hasChatCompletion) {
-                try {
-                    console.log("Using chatCompletion method");
-                    const chatResponse = await llm.chatCompletion({
-                        messages: [{ role: 'user', content: input }],
-                        temperature: 0.7,
-                        max_tokens: 256
-                    });
+            try {
+                // Try chat completion
+                console.log("Attempting chat completion");
 
-                    console.log("Chat response:", chatResponse);
+                // Prepare chat completion options
+                const chatOptions = {
+                    temperature: 0.7,
+                    max_tokens: 256
+                };
 
-                    if (chatResponse && chatResponse.choices && chatResponse.choices.length > 0) {
-                        const message = chatResponse.choices[0].message;
-                        responseText = message.content || "No content in response";
-                    } else {
-                        throw new Error("Unexpected chat response format");
-                    }
-                } catch (chatError) {
-                    console.error("Chat completion failed:", chatError);
-                    throw chatError; // Re-throw to try next method
+                // Add system prompt if provided
+                if (systemPrompt && systemPrompt.trim()) {
+                    chatOptions.systemPrompt = systemPrompt.trim();
                 }
-            } else if (hasCompletion) {
+
+                result = await llm.chatCompletion({
+                    messages: [{ role: 'user', content: input }],
+                    ...chatOptions
+                });
+
+                if (result && result.success === false) {
+                    throw new Error(result.error || "Chat completion failed");
+                }
+
+                if (result && result.choices && result.choices.length > 0) {
+                    const message = result.choices[0].message;
+                    responseText = message.content || "No content in response";
+                } else {
+                    throw new Error("Unexpected chat response format");
+                }
+            } catch (chatError) {
+                console.error("Chat completion failed, trying completion:", chatError);
+
                 try {
-                    console.log("Using completion method");
-                    const completionResponse = await llm.completion({
+                    // Fall back to completion
+                    result = await llm.completion({
                         prompt: input,
                         temperature: 0.7,
                         max_tokens: 256
                     });
 
-                    console.log("Completion response:", completionResponse);
+                    if (result && result.success === false) {
+                        throw new Error(result.error || "Completion failed");
+                    }
 
-                    if (completionResponse && completionResponse.choices && completionResponse.choices.length > 0) {
-                        responseText = completionResponse.choices[0].text || '';
+                    if (result && result.choices && result.choices.length > 0) {
+                        responseText = result.choices[0].text || '';
                     } else {
                         throw new Error("Unexpected completion response format");
                     }
                 } catch (completionError) {
-                    console.error("Completion failed:", completionError);
-                    throw completionError; // Re-throw to try next method
-                }
-            } else if (hasGenerate) {
-                try {
-                    console.log("Using generate method");
-                    // Some models might use a different API
-                    const generateResponse = await llm.generate(input, {
-                        temperature: 0.7,
-                        max_length: 256
-                    });
+                    console.error("Completion failed, trying generate:", completionError);
 
-                    console.log("Generate response:", generateResponse);
+                    try {
+                        // Last resort: try generate
+                        result = await llm.generate(input, {
+                            temperature: 0.7,
+                            max_length: 256
+                        });
 
-                    // Handle different response formats
-                    if (typeof generateResponse === 'string') {
-                        responseText = generateResponse;
-                    } else if (generateResponse && generateResponse.text) {
-                        responseText = generateResponse.text;
-                    } else if (generateResponse && generateResponse.response) {
-                        responseText = generateResponse.response;
-                    } else {
-                        throw new Error("Unexpected generate response format");
+                        if (result && result.success === false) {
+                            throw new Error(result.error || "Generate failed");
+                        }
+
+                        // Handle different response formats
+                        if (typeof result === 'string') {
+                            responseText = result;
+                        } else if (result && result.text) {
+                            responseText = result.text;
+                        } else if (result && result.response) {
+                            responseText = result.response;
+                        } else {
+                            throw new Error("Unexpected generate response format");
+                        }
+                    } catch (generateError) {
+                        console.error("Generate failed:", generateError);
+                        throw generateError;
                     }
-                } catch (generateError) {
-                    console.error("Generate failed:", generateError);
-                    throw generateError;
                 }
-            } else {
-                throw new Error("No compatible generation method found on this model");
             }
 
+            // Format the output based on content type
+            const formatted = formatOutput(responseText);
+
             setOutput(responseText);
+            setFormattedOutput(formatted);
             setGenerating(false);
         } catch (err) {
             console.error("Generation failed:", err);
@@ -289,6 +499,10 @@ function AIModelComponent() {
                 [selectedModelId]: `Generation failed: ${err.message}`
             }));
             setOutput("Failed to generate text. Please try a different model or input.");
+            setFormattedOutput({
+                formattedContent: "Failed to generate text. Please try a different model or input.",
+                type: 'text'
+            });
             setGenerating(false);
         }
     };
@@ -325,7 +539,7 @@ function AIModelComponent() {
         // If already loading, do nothing (continue loading)
     };
 
-    // Delete a model from cache
+    // Delete a model from cache and IndexedDB
     const handleDeleteModel = async (modelId, e) => {
         e.stopPropagation(); // Prevent triggering model selection
 
@@ -335,7 +549,13 @@ function AIModelComponent() {
         }
 
         try {
+            // Delete from traditional cache
             await deleteModelInCache(modelId);
+
+            // Also delete from IndexedDB if it exists there
+            if (await hasModelInDB(modelId)) {
+                await deleteModel(modelId);
+            }
 
             // Update cached models list
             setCachedModels(prev => prev.filter(id => id !== modelId));
@@ -351,8 +571,11 @@ function AIModelComponent() {
     const refreshCachedModels = async () => {
         const cached = [];
         for (const model of availableModels) {
-            const isCached = await hasModelInCache(model.model_id);
-            if (isCached) {
+            // Check both traditional cache and IndexedDB
+            const isCachedTraditional = await hasModelInCache(model.model_id);
+            const isCachedIndexedDB = await hasModelInDB(model.model_id);
+
+            if (isCachedTraditional || isCachedIndexedDB) {
                 cached.push(model.model_id);
             }
         }
@@ -382,6 +605,18 @@ function AIModelComponent() {
                             </button>
                         )}
                     </div>
+                    {!isOnline && (
+                        <div className="offline-notice">
+                            <p>📵 You're offline! Only cached models are available.</p>
+                        </div>
+                    )}
+
+                    {usingIndexedDB && (
+                        <div className="optimization-notice">
+                            <p>⚡ Using IndexedDB for faster model loading</p>
+                        </div>
+                    )}
+
                     <div className="model-list">
                         {availableModels
                             // Sort models: selected model first, then cached models, then others
@@ -609,13 +844,30 @@ function AIModelComponent() {
                 {/* Right side - Chat interface */}
                 <div className="chat-container">
                     {selectedModelId && (
-                        <div className="model-info">
-                            <h3>Current Model: {
-                                availableModels.find(m => m.model_id === selectedModelId)?.model_name ||
-                                selectedModelId.split('/').pop() ||
-                                selectedModelId ||
-                                "Unknown"
-                            }</h3>
+                        <div className={`model-info ${loadingModels[selectedModelId] ? 'loading' : ''} ${modelErrors[selectedModelId] ? 'error' : ''} ${llm && activeWorkerId ? 'ready' : ''}`}>
+                            <h3>
+                                Current Model: {
+                                    availableModels.find(m => m.model_id === selectedModelId)?.model_name ||
+                                    selectedModelId.split('/').pop() ||
+                                    selectedModelId ||
+                                    "Unknown"
+                                }
+                                {loadingModels[selectedModelId] && (
+                                    <span className="model-status-badge loading">
+                                        <span className="spinner-tiny"></span>
+                                        Loading...
+                                    </span>
+                                )}
+                                {modelErrors[selectedModelId] && (
+                                    <span className="model-status-badge error">Error</span>
+                                )}
+                                {llm && activeWorkerId && !loadingModels[selectedModelId] && !modelErrors[selectedModelId] && (
+                                    <span className="model-status-badge ready">Ready</span>
+                                )}
+                                {!llm && !activeWorkerId && !loadingModels[selectedModelId] && !modelErrors[selectedModelId] && (
+                                    <span className="model-status-badge pending">Pending Download</span>
+                                )}
+                            </h3>
 
                             <div className="model-info-details">
                                 {/* Display model size and ID for the selected model */}
@@ -743,6 +995,58 @@ function AIModelComponent() {
                         </div>
                     )}
 
+                    {/* Advanced Settings Accordion */}
+                    <div className="advanced-settings">
+                        <button
+                            className={`advanced-settings-toggle ${showAdvancedSettings ? 'open' : ''}`}
+                            onClick={() => setShowAdvancedSettings(!showAdvancedSettings)}
+                        >
+                            <span className="toggle-icon">{showAdvancedSettings ? '▼' : '▶'}</span>
+                            Advanced Settings
+                        </button>
+
+                        {showAdvancedSettings && (
+                            <div className="advanced-settings-content">
+                                <div className="setting-group">
+                                    <label htmlFor="system-prompt">System Prompt:</label>
+                                    <textarea
+                                        id="system-prompt"
+                                        value={systemPrompt}
+                                        onChange={(e) => setSystemPrompt(e.target.value)}
+                                        placeholder="Enter a system prompt to guide the model's behavior..."
+                                        className="system-prompt-input"
+                                        disabled={generating}
+                                    />
+                                    <p className="setting-description">
+                                        The system prompt helps define the AI's behavior and context.
+                                        It's sent before your message to guide the model's responses.
+                                    </p>
+                                    <div className="system-prompt-examples">
+                                        <p>Examples:</p>
+                                        <button
+                                            className="example-prompt-btn"
+                                            onClick={() => setSystemPrompt("Always return in Markdown format")}
+                                        >
+                                            Use Markdown Format
+                                        </button>
+                                        <button
+                                            className="example-prompt-btn"
+                                            onClick={() => setSystemPrompt("You are a helpful coding assistant. Always include code examples in your responses.")}
+                                        >
+                                            Coding Assistant
+                                        </button>
+                                        <button
+                                            className="example-prompt-btn"
+                                            onClick={() => setSystemPrompt("Always format your code examples using markdown code blocks with the appropriate language specified. For example: ```javascript\nconst example = 'code';\n```")}
+                                        >
+                                            Code Blocks with Language
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
                     <div className="input-area">
                         <textarea
                             value={input}
@@ -752,7 +1056,7 @@ function AIModelComponent() {
                         />
                         <button
                             onClick={generateText}
-                            disabled={generating || !input.trim() || !llm || loadingModels[selectedModelId]}
+                            disabled={generating || !input.trim() || !llm || !activeWorkerId || loadingModels[selectedModelId]}
                             className="generate-button"
                         >
                             {generating ? (
@@ -763,10 +1067,17 @@ function AIModelComponent() {
                             ) : loadingModels[selectedModelId] ? (
                                 <>
                                     <span className="spinner-small"></span>
-                                    🔄 Warming up neurons...
+                                    🔄 Loading model... {loadingModels[selectedModelId]?.progress || 0}%
                                 </>
-                            ) : !llm ? (
-                                '🎯 Pick a model first!'
+                            ) : !llm || !activeWorkerId ? (
+                                selectedModelId ? (
+                                    <>
+                                        <span className="spinner-small"></span>
+                                        ⏳ Waiting for model to download...
+                                    </>
+                                ) : (
+                                    '🎯 Pick a model first!'
+                                )
                             ) : (
                                 '✨ Let\'s Go!'
                             )}
@@ -775,7 +1086,45 @@ function AIModelComponent() {
 
                     <div className="output-area" ref={outputRef}>
                         {output ? (
-                            <div className="output-content">{output}</div>
+                            <div className={`output-content output-${formattedOutput.type}`}>
+                                {formattedOutput.type === 'markdown' ? (
+                                    <div className="markdown-content">
+                                        <ReactMarkdown
+                                            components={{
+                                                // Custom renderer for code blocks
+                                                code: ({node, inline, className, children, ...props}) => {
+                                                    const match = /language-(\w+)/.exec(className || '');
+                                                    const language = match ? match[1] : '';
+
+                                                    // If it's an inline code, render it as is
+                                                    if (inline) {
+                                                        return (
+                                                            <code className={className} {...props}>
+                                                                {children}
+                                                            </code>
+                                                        );
+                                                    }
+
+                                                    // For code blocks, use our custom CodeBlock component
+                                                    return (
+                                                        <CodeBlock language={language}>
+                                                            {String(children).replace(/\n$/, '')}
+                                                        </CodeBlock>
+                                                    );
+                                                }
+                                            }}
+                                        >
+                                            {formattedOutput.formattedContent}
+                                        </ReactMarkdown>
+                                    </div>
+                                ) : formattedOutput.type === 'json' ? (
+                                    <CodeBlock language="json">
+                                        {formattedOutput.formattedContent}
+                                    </CodeBlock>
+                                ) : (
+                                    formattedOutput.formattedContent || output
+                                )}
+                            </div>
                         ) : generating ? (
                             <div className="generating">
                                 <span className="spinner-small"></span>
@@ -792,16 +1141,59 @@ function AIModelComponent() {
                         <div className="loading-models-summary">
                             <h4>Models Loading in Background:</h4>
                             <ul>
-                                {Object.entries(loadingModels).map(([modelId, info]) => (
-                                    <li key={modelId}>
-                                        {availableModels.find(m => m.model_id === modelId)?.model_name ||
-                                         modelId.split('/').pop() ||
-                                         modelId}: {info.progress}%
-                                    </li>
-                                ))}
+                                {Object.entries(loadingModels).map(([modelId, info]) => {
+                                    const modelName = availableModels.find(m => m.model_id === modelId)?.model_name ||
+                                                     modelId.split('/').pop() ||
+                                                     modelId;
+
+                                    // Get download progress info if available
+                                    const downloadInfo = downloadProgress[modelId];
+
+                                    return (
+                                        <li key={modelId} className="loading-model-item">
+                                            <div className="loading-model-name">{modelName}</div>
+                                            <div className="loading-model-status">{info.status}</div>
+                                            <div className="loading-model-progress-container">
+                                                <div
+                                                    className="loading-model-progress-bar"
+                                                    style={{width: `${info.progress}%`}}
+                                                ></div>
+                                                <span className="loading-model-progress-text">{info.progress}%</span>
+                                            </div>
+                                            {downloadInfo && downloadInfo.phase === 'downloading' && (
+                                                <div className="loading-model-chunks">
+                                                    Chunk {downloadInfo.chunk}/{downloadInfo.numChunks}
+                                                </div>
+                                            )}
+                                        </li>
+                                    );
+                                })}
                             </ul>
                         </div>
                     )}
+
+                    {/* Performance metrics display */}
+                    <div className="performance-metrics">
+                        <h4>Performance Optimizations:</h4>
+                        <ul>
+                            <li>
+                                <span className="metric-name">Web Workers:</span>
+                                <span className="metric-value">{workerPool ? `Active (${workerPool.size} workers)` : 'Initializing...'}</span>
+                            </li>
+                            <li>
+                                <span className="metric-name">IndexedDB Storage:</span>
+                                <span className="metric-value">{usingIndexedDB ? 'Active' : 'Available'}</span>
+                            </li>
+                            <li>
+                                <span className="metric-name">Service Worker:</span>
+                                <span className="metric-value">{navigator.serviceWorker && navigator.serviceWorker.controller ? 'Active' : 'Registering...'}</span>
+                            </li>
+                            <li>
+                                <span className="metric-name">Network Status:</span>
+                                <span className="metric-value">{isOnline ? '🟢 Online' : '🔴 Offline'}</span>
+                            </li>
+                        </ul>
+                    </div>
                 </div>
             </div>
         </div>
